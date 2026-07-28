@@ -1,22 +1,21 @@
 """Точка входа для деплоя на Render (free web service, спящий тариф).
 
-Один фоновый event loop на весь процесс: в нём живут Bot, планировщик
-напоминаний и все обращения к SQLite. Flask-воркер только принимает POST от
-Telegram и перекидывает апдейт в этот loop через run_coroutine_threadsafe.
+Здесь намеренно нет фонового потока с планировщиком — только Flask и по одному
+короткоживущему event loop'у на каждый апдейт. Причины две:
 
-ponytail: так сделано намеренно. Раньше на каждый вебхук создавался свой
-asyncio.run() со своим loop'ом, и он конкурировал за файл базы с loop'ом
-напоминаний — SQLite отдавал "database is locked" на выборе даты. Один loop =
-обращения к базе выстраиваются в очередь, конкуренции нет.
+1. Планировщик на спящем тарифе всё равно почти бесполезен: пока процесс спит,
+   он не тикает. Напоминания реально уходят только когда сервис разбудил
+   входящий вебхук — значит проще проверять их прямо в обработчике вебхука.
+2. Второй поток со своим loop'ом конкурировал с обработчиком вебхука за файл
+   SQLite, и база отдавала "database is locked" на выборе даты. Без него в
+   каждый момент времени с базой работает ровно одно соединение.
 
-ponytail: на бесплатном тарифе процесс засыпает после ~15 мин без запросов —
-пока он спит, планировщик тоже не тикает, напоминания уйдут при следующем
-пробуждении (следующий вебхук). Это ограничение тарифа, не баг.
+Для локальной разработки остаётся bot.py (long polling + APScheduler).
 """
 
 import asyncio
 import logging
-import threading
+import time
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -37,40 +36,41 @@ dp.include_router(admin.router)
 
 app = Flask(__name__)
 
-_loop = asyncio.new_event_loop()
-_bot: Bot | None = None
-_ready = threading.Event()
+# Как часто догонять напоминания. Гоняться на каждом апдейте незачем — запрос к
+# базе дешёвый, но лишний.
+REMINDER_INTERVAL_SEC = 300
+
+_initialized = False
+_last_reminder_check = 0.0
 
 
-def _run_loop() -> None:
-    asyncio.set_event_loop(_loop)
+async def _handle_update(update: Update) -> None:
+    global _initialized, _last_reminder_check
 
-    async def _setup() -> None:
-        global _bot
-        # init_db переключает базу в WAL — это должно случиться до того, как
-        # появятся другие соединения, поэтому строго первым делом.
-        await storage.init_db()
-        _bot = Bot(token=config.BOT_TOKEN, session=AiohttpSession(timeout=5))
-        reminders.start(_bot)
+    # Свежий Bot на каждый запрос: сессия aiohttp привязана к тому loop'у, в
+    # котором создана, а asyncio.run() каждый раз открывает новый.
+    bot = Bot(token=config.BOT_TOKEN, session=AiohttpSession(timeout=5))
+    try:
+        if not _initialized:
+            # Диск на free-тарифе эфемерный: после каждого сна/передеплоя базы
+            # нет, поэтому схему создаём при первом апдейте после старта.
+            await storage.init_db()
+            _initialized = True
 
-    _loop.run_until_complete(_setup())
-    _ready.set()
-    _loop.run_forever()
+        await dp.feed_update(bot, update)
 
-
-threading.Thread(target=_run_loop, daemon=True, name="bot-loop").start()
+        if time.monotonic() - _last_reminder_check > REMINDER_INTERVAL_SEC:
+            _last_reminder_check = time.monotonic()
+            await reminders.send_due(bot)
+    finally:
+        await bot.session.close()
 
 
 @app.route("/" + config.BOT_TOKEN, methods=["POST"])
 def webhook():
-    # На холодном старте Render loop может ещё подниматься — ждём инициализацию,
-    # иначе первый апдейт после пробуждения упрётся в _bot = None.
-    if not _ready.wait(30):
-        return "starting", 503
     update = Update.model_validate(request.get_json(force=True))
-    future = asyncio.run_coroutine_threadsafe(dp.feed_update(_bot, update), _loop)
     try:
-        future.result(timeout=50)
+        asyncio.run(_handle_update(update))
     except Exception:
         logging.exception("Ошибка обработки апдейта")
     # Отвечаем ok даже при ошибке: на не-200 Telegram ретраит тот же апдейт и
