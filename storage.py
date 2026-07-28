@@ -39,12 +39,9 @@ _BOOKING_FIELDS = """
 
 
 async def _tune(db: aiosqlite.Connection) -> None:
-    # ponytail: без этого конкурентный доступ (вебхук-запрос + фоновый поток
-    # напоминаний, оба бьют в один файл) роняет чтения с "database is locked" —
-    # busy_timeout заставляет SQLite подождать и повторить вместо мгновенной
-    # ошибки, WAL разрешает читателям работать, пока идёт запись.
+    # Без busy_timeout SQLite отдаёт "database is locked" мгновенно, как только
+    # файл занят другим соединением, — с ним ждёт и повторяет.
     await db.execute("PRAGMA busy_timeout = 5000")
-    await db.execute("PRAGMA journal_mode = WAL")
 
 
 @asynccontextmanager
@@ -56,8 +53,13 @@ async def _db():
 
 
 async def init_db() -> None:
+    """Вызывать один раз на старте, до того как появятся другие соединения:
+    переключение в WAL берёт эксклюзивную блокировку и на живой базе падает.
+    Режим пишется в заголовок файла, поэтому включать его в каждом соединении
+    не нужно — а именно это и роняло вебхук."""
     async with aiosqlite.connect(DB_PATH) as db:
         await _tune(db)
+        await db.execute("PRAGMA journal_mode = WAL")
         await db.executescript(SCHEMA)
         await db.commit()
 

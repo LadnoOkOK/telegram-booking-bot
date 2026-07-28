@@ -1,11 +1,13 @@
 """Точка входа для деплоя на Render (free web service, спящий тариф).
 
-В отличие от eva_bot, здесь есть фоновые напоминания (APScheduler) — им нужен
-долгоживущий event loop с постоянным Bot/session, а не новый Bot на каждый
-HTTP-запрос. Поэтому: отдельный поток со своим loop поднимает планировщик один
-раз при старте процесса, а обработка вебхука по-прежнему открывает свежий Bot
-на каждый апдейт (тот же приём, что в eva_bot/webhook_app.py, и по той же
-причине — Bot, созданный при импорте, был бы привязан к чужому loop).
+Один фоновый event loop на весь процесс: в нём живут Bot, планировщик
+напоминаний и все обращения к SQLite. Flask-воркер только принимает POST от
+Telegram и перекидывает апдейт в этот loop через run_coroutine_threadsafe.
+
+ponytail: так сделано намеренно. Раньше на каждый вебхук создавался свой
+asyncio.run() со своим loop'ом, и он конкурировал за файл базы с loop'ом
+напоминаний — SQLite отдавал "database is locked" на выборе даты. Один loop =
+обращения к базе выстраиваются в очередь, конкуренции нет.
 
 ponytail: на бесплатном тарифе процесс засыпает после ~15 мин без запросов —
 пока он спит, планировщик тоже не тикает, напоминания уйдут при следующем
@@ -35,40 +37,44 @@ dp.include_router(admin.router)
 
 app = Flask(__name__)
 
+_loop = asyncio.new_event_loop()
+_bot: Bot | None = None
+_ready = threading.Event()
 
-def _run_scheduler() -> None:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+
+def _run_loop() -> None:
+    asyncio.set_event_loop(_loop)
 
     async def _setup() -> None:
+        global _bot
+        # init_db переключает базу в WAL — это должно случиться до того, как
+        # появятся другие соединения, поэтому строго первым делом.
         await storage.init_db()
-        bot = Bot(token=config.BOT_TOKEN, session=AiohttpSession(timeout=5))
-        reminders.start(bot)
+        _bot = Bot(token=config.BOT_TOKEN, session=AiohttpSession(timeout=5))
+        reminders.start(_bot)
 
-    loop.run_until_complete(_setup())
-    loop.run_forever()
-
-
-threading.Thread(target=_run_scheduler, daemon=True, name="reminders-loop").start()
+    _loop.run_until_complete(_setup())
+    _ready.set()
+    _loop.run_forever()
 
 
-async def _handle_update(update: Update) -> None:
-    # ponytail: свежий Bot (и его aiohttp-сессия) на каждый запрос, в своём же
-    # event loop — Bot, созданный при импорте модуля, держит сессию, привязанную
-    # к тому loop'у, в котором был создан, а asyncio.run() открывает новый loop
-    # на каждый вызов, так что последующие запросы упирались бы в закрытый loop.
-    session = AiohttpSession(timeout=5)
-    bot = Bot(token=config.BOT_TOKEN, session=session)
-    try:
-        await dp.feed_update(bot, update)
-    finally:
-        await bot.session.close()
+threading.Thread(target=_run_loop, daemon=True, name="bot-loop").start()
 
 
 @app.route("/" + config.BOT_TOKEN, methods=["POST"])
 def webhook():
+    # На холодном старте Render loop может ещё подниматься — ждём инициализацию,
+    # иначе первый апдейт после пробуждения упрётся в _bot = None.
+    if not _ready.wait(30):
+        return "starting", 503
     update = Update.model_validate(request.get_json(force=True))
-    asyncio.run(_handle_update(update))
+    future = asyncio.run_coroutine_threadsafe(dp.feed_update(_bot, update), _loop)
+    try:
+        future.result(timeout=50)
+    except Exception:
+        logging.exception("Ошибка обработки апдейта")
+    # Отвечаем ok даже при ошибке: на не-200 Telegram ретраит тот же апдейт и
+    # зацикливается на упавшем. Причина уже в логах.
     return "ok"
 
 
