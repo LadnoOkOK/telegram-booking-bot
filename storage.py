@@ -38,15 +38,26 @@ _BOOKING_FIELDS = """
 """
 
 
+async def _tune(db: aiosqlite.Connection) -> None:
+    # ponytail: без этого конкурентный доступ (вебхук-запрос + фоновый поток
+    # напоминаний, оба бьют в один файл) роняет чтения с "database is locked" —
+    # busy_timeout заставляет SQLite подождать и повторить вместо мгновенной
+    # ошибки, WAL разрешает читателям работать, пока идёт запись.
+    await db.execute("PRAGMA busy_timeout = 5000")
+    await db.execute("PRAGMA journal_mode = WAL")
+
+
 @asynccontextmanager
 async def _db():
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
+        await _tune(db)
         yield db
 
 
 async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
+        await _tune(db)
         await db.executescript(SCHEMA)
         await db.commit()
 
@@ -85,6 +96,7 @@ async def create_booking(
     """Проверка пересечения и вставка в одной транзакции — иначе два клиента
     успевают занять один слот между SELECT и INSERT. None = слот уже занят."""
     async with aiosqlite.connect(DB_PATH, isolation_level=None) as db:
+        await _tune(db)
         await db.execute("BEGIN IMMEDIATE")
         cur = await db.execute(
             f"""SELECT 1 FROM bookings
